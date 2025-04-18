@@ -57,6 +57,8 @@ async function extractTextElementsFromPDF(pdfPath) {
   const pdfjsWorker = require('pdfjs-dist/build/pdf.worker.entry'); pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
  
   
+
+  
   const loadingTask = pdfjsLib.getDocument({data: dataBuffer});
   const pdf = await loadingTask.promise;
   

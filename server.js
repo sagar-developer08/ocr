@@ -1,21 +1,32 @@
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
-const axios = require('axios');
+// const axios = require('axios');
 const path = require('path');
 const { processAudioPipeline } = require('./audioProcessor');
 const ocrApp = require('./ocr');
-const {
-  // ensureDevanagariFont,
-  // extractTextElementsFromPDF,
-  // getPDFDimensions,
-  // batchTranslateTextElements,
-  // createTranslatedPDF,
-  translatePDFWithLayout
-} = require('./pdfTranslateHelper');
+// const {
+//   // ensureDevanagariFont,
+//   // extractTextElementsFromPDF,
+//   // getPDFDimensions,
+//   // batchTranslateTextElements,
+//   // createTranslatedPDF,
+//   translatePDFWithLayout
+// } = require('./pdfTranslateHelper');
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
+const nodemailer = require('nodemailer');
+const emailConfig = require('./email-config');
+// const path = require('path');
+// const fs = require('fs');
+const { translatePDFWithLayout, extractTextElementsFromPDF } = require('./pdfTranslateHelper');
+const axios = require('axios');
+const { translateImage } = require('./imageTranslateHelper');
+
+// Middleware for parsing JSON bodies
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Mount OCR route
 app.use('/', ocrApp);
@@ -102,6 +113,127 @@ app.post('/translate-pdf', upload.single('file'), async (req, res) => {
 
     res.status(500).json({ status: 'error', message: 'Translation failed.' });
   }
+});
+
+app.post('/send-mail', upload.single('document'), async (req, res) => {
+    try {
+        const {
+            recipientEmail,
+            renewal,
+            previousApplicationId,
+            sectionLetter,
+            dheSanctionId
+        } = req.body;
+
+        if (!req.file) {
+            return res.status(400).json({ error: 'No document uploaded' });
+        }
+
+        if (!recipientEmail || !renewal || !previousApplicationId || !sectionLetter || !dheSanctionId) {
+            return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+        }
+
+        // Create temporary directories
+        // Create temp directory if it doesn't exist
+        const tempDir = path.join(__dirname, 'temp');
+        if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+        }
+
+        // Translate the uploaded document
+        const translatedPdfPath = path.join(tempDir, `translated_${Date.now()}.pdf`);
+        await translatePDFWithLayout(req.file.path, translatedPdfPath);
+
+        // Wait for the file to be written
+        await new Promise((resolve, reject) => {
+            const interval = setInterval(() => {
+                if (fs.existsSync(translatedPdfPath)) {
+                    clearInterval(interval);
+                    resolve();
+                }
+            }, 100);
+            setTimeout(() => {
+                clearInterval(interval);
+                reject(new Error('File write timeout'));
+            }, 30000); // 30 second timeout
+        });
+
+        // Read and customize the email template
+        const templatePath = path.join(__dirname, 'Email', 'email-template-maha-dbt.html');
+        let html = fs.readFileSync(templatePath, 'utf8');
+        
+        // Replace placeholders in the template
+        html = html.replace('{{previousApplicationId}}', previousApplicationId)
+                  .replace('{{dheSanctionId}}', dheSanctionId)
+                  .replace('{{sectionLetter}}', sectionLetter)
+                  .replace('{{renewal}}', renewal);
+
+        // Configure Amazon SES transporter
+        const transporter = nodemailer.createTransport({
+            host: emailConfig.SMTP_SERVER,
+            port: emailConfig.SMTP_PORT,
+            secure: false, // use STARTTLS
+            auth: {
+                user: emailConfig.SMTP_USER,
+                pass: emailConfig.SMTP_PASSWORD
+            }
+        });
+
+        // Prepare attachments
+        const attachments = [
+            {
+                filename: path.basename(req.file.originalname),
+                content: fs.readFileSync(translatedPdfPath),
+                contentType: 'application/pdf'
+            }
+        ];
+
+        // Extract text elements from the translated document
+        const translatedElements = await extractTextElementsFromPDF(translatedPdfPath);
+
+        // Create translation JSON response
+        const translationResponse = {
+            document: {
+                translated: translatedElements,
+                metadata: {
+                    sourceLanguage: 'mr',
+                    targetLanguage: 'hi',
+                    timestamp: new Date().toISOString(),
+                    originalFilename: req.file.originalname
+                }
+            }
+        };
+
+        // Send email with only the translated document
+        await transporter.sendMail({
+            to: recipientEmail,
+            from: emailConfig.FROM_EMAIL,
+            subject: `Translated Document - ${path.basename(req.file.originalname)}`,
+            html,
+            attachments
+        });
+        
+        res.json({ 
+            status: 'success', 
+            message: 'Email sent successfully',
+            translation: translationResponse
+        });
+    } catch (error) {
+        console.error('Error sending email:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to send email' });
+    }
+});
+
+const { convertTextToSpeech } = require('./ttsHelper');
+
+app.post('/tts', async (req, res) => {
+    try {
+        const response = await convertTextToSpeech(req.body);
+        res.json(response);
+    } catch (error) {
+        console.error('Error in TTS:', error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 app.listen(4000, () => console.log('[INFO] Server started on http://localhost:4000'));
